@@ -1,3 +1,31 @@
+# DIEP integrator + Transformer + Linear
+
+This research fork integrates DIEP pair/triplet descriptors into the PyG M3GNet
+implementation, followed by a Transformer encoder and a linear atomic-energy
+head. Atomic energies are summed per structure; MatGL's Potential wrapper
+computes forces and stress from energy derivatives.
+
+- Pair DIEP descriptors use a polynomial cutoff envelope; triplet interactions
+  retain the two-edge cutoff envelope and map filtered edge IDs to original edges.
+- Lightning advances the learning-rate scheduler once per epoch, with runtime
+  checks and checkpoint-resume validation.
+- The prepared Gadi campaign targets **200 epochs**, starting with a **2-epoch
+  pilot** using batch size 32 and gradient accumulation 4.
+- See [Gadi setup and submission](gadi/README_GADI.md) for the current entry point,
+  environment requirements, and resume commands.
+- A local architecture probe is available at
+  [show_full_diep_architecture.py](测试笔记本/tools/show_full_diep_architecture.py).
+
+This is a research implementation, not released trained weights. Local forward,
+first-coordinate-derivative, short training and resume checks have passed. The
+previously observed triplet-projection second-coordinate-derivative NaN remains
+unresolved; these checks do not establish globally smooth higher derivatives.
+GPU batch32 performance must be measured in the pilot.
+
+The original MatGL documentation and attribution follow.
+
+---
+
 [![GitHub license](https://img.shields.io/github/license/materialyzeai/matgl)](https://github.com/materialyzeai/matgl/blob/main/LICENSE)
 [![Lint](https://github.com/materialyzeai/matgl/workflows/Lint/badge.svg)](https://github.com/materialyzeai/matgl/workflows/Lint/badge.svg)
 [![Test](https://github.com/materialyzeai/matgl/actions/workflows/test.yml/badge.svg)](https://github.com/materialyzeai/matgl/actions/workflows/test.yml)

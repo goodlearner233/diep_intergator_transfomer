@@ -41,3 +41,17 @@ MatPES-*.json
 *.ckpt
 /datasets/
 .ipynb_checkpoints/
+
+# Local training data, generated diagnostics, and personal meeting/budget notes.
+/runs/
+/reports/
+/测试笔记本/results/
+/gadi/budget_report_*.json
+/gadi/README_200epochs.md
+/tools/build_sherif_meeting_pack.py
+/tools/render_sherif_flowcharts.cjs
+.venv*/
+__pycache__/
+.env
+.env.*
+events.out.tfevents.*

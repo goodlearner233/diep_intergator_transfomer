@@ -52,6 +52,11 @@ from matgl.layers._core import (
     GatedMLP,
     build_gated_equivariant_mlp,
 )
+from matgl.layers._diep import (
+    DIEPGrid,  # DIEP 二维网格
+    compute_bond_features,  # 二体描述符入口
+    compute_triplet_features,  # 三体描述符入口
+)
 from matgl.layers._embedding import EmbeddingBlock, TensorEmbedding
 from matgl.layers._graph_convolution import (
     CHGNetAtomGraphBlock,

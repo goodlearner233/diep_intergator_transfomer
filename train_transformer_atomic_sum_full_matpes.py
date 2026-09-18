@@ -1,6 +1,6 @@
 
 """
-Full-dataset training script for Transformer Linear Atomic-Sum M3GNet.
+Full-dataset training script for DIEP + Transformer Linear Atomic-Sum M3GNet.
 
 Overview
 --------
@@ -13,7 +13,7 @@ The model follows this pipeline:
 
     crystal structure
         -> graph construction
-        -> distance and three-body basis expansion
+        -> DIEP pair/triplet descriptors with cutoff envelopes
         -> M3GNet graph-convolution blocks
         -> final atomic node features
         -> Transformer encoder
@@ -110,7 +110,7 @@ The script saves:
     epoch-...-step-....ckpt
         One full checkpoint after every completed epoch. These files retain
         model, optimizer, scheduler, epoch, and global-step state for diagnosis
-        and exact training resumption.
+        and checkpoint-based training resumption.
 
     metrics.csv
         Per-epoch training and validation metrics.
@@ -127,6 +127,11 @@ The script saves:
         Final metrics evaluated using the best checkpoint.
 
 The best checkpoint is automatically loaded for final test-set evaluation.
+For segmented Gadi runs, pass --skip-test on intermediate segments. The next
+--max-epochs value is a cumulative endpoint, not a number of additional epochs.
+Keep --decay-steps fixed across segments; Lightning advances it once per epoch.
+This DIEP repository replaces the radial/angular descriptors with its grid
+features and explicitly records grid and cutoff arguments in run_config.json.
 
 Single-GPU Example
 ------------------
@@ -178,6 +183,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import math
 import sys
 import time
 from functools import partial
@@ -188,9 +194,8 @@ import lightning as L
 import numpy as np
 import torch
 from ase.stress import voigt_6_to_full_3x3_stress
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 # Prefer the modified MatGL source tree beside this script over site-packages.
@@ -204,6 +209,15 @@ from matgl.config import DEFAULT_ELEMENTS  # noqa: E402
 from matgl.graph.data import MGLDataLoader, collate_fn_pes, split_dataset  # noqa: E402
 from matgl.models._m3gnet import M3GNet  # noqa: E402
 from matgl.utils.training import MGLDatasetLoader, PotentialLightningModule, xavier_init  # noqa: E402
+
+
+def math_attention():
+    """Use differentiable MATH attention with both old and new PyTorch APIs."""
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        return sdpa_kernel(SDPBackend.MATH)
+    except ImportError:
+        return torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False)
 
 
 def parse_devices(value: str) -> int | str:
@@ -249,7 +263,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--devices", type=parse_devices, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None, help="Optional Lightning checkpoint to resume from.")
+    parser.add_argument("--skip-test", action="store_true", help="Skip held-out test evaluation between training segments.")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--decay-steps", type=int, default=1000, help="Cosine period in completed epochs; unchanged by job segmentation.")
+    parser.add_argument("--decay-alpha", type=float, default=0.01)
     parser.add_argument("--cutoff", type=float, default=5.0)
+    parser.add_argument("--threebody-cutoff", type=float, default=4.0)
+    parser.add_argument("--diep-grid-half-length", type=float, default=5.0)
+    parser.add_argument("--diep-grid-spacing", type=float, default=1.0)
     parser.add_argument("--transformer-nhead", type=int, default=4)
     parser.add_argument("--transformer-num-layers", type=int, default=1)
     parser.add_argument("--transformer-dim-ff", type=int, default=128)
@@ -287,11 +308,78 @@ def json_ready(value: Any) -> Any:
     return value
 
 
+class EpochScheduleCheck(Callback):
+    """Observe, but never advance, the epoch-based cosine scheduler."""
+
+    def __init__(self, lr: float, decay_steps: int, decay_alpha: float):
+        self.lr = lr
+        self.decay_steps = decay_steps
+        self.decay_alpha = decay_alpha
+        self.records: list[dict[str, Any]] = []
+
+    def check(self, trainer: L.Trainer, phase: str) -> None:
+        scheduler = trainer.lr_scheduler_configs[0].scheduler
+        completed = trainer.current_epoch
+        minimum = self.lr * self.decay_alpha
+        expected_lr = minimum + (self.lr - minimum) * (1 + math.cos(math.pi * completed / self.decay_steps)) / 2
+        if scheduler.last_epoch != completed:
+            raise RuntimeError(
+                f"Learning-rate schedule mismatch: completed epochs={completed}, "
+                f"scheduler.last_epoch={scheduler.last_epoch}. Check duplicate step() calls or an incompatible checkpoint."
+            )
+        if scheduler.T_max != self.decay_steps or not math.isclose(scheduler.eta_min, minimum):
+            raise RuntimeError("Checkpoint scheduler configuration differs from the requested training configuration.")
+        actual_lr = trainer.optimizers[0].param_groups[0]["lr"]
+        if not math.isclose(actual_lr, expected_lr, rel_tol=1e-9, abs_tol=1e-12):
+            raise RuntimeError(f"Learning-rate value mismatch: expected {expected_lr}, got {actual_lr}.")
+        record = dict(phase=phase,completed_epochs=completed,scheduler_last_epoch=scheduler.last_epoch,
+                      learning_rate=actual_lr,expected_learning_rate=expected_lr)
+        self.records.append(record)
+        print("LR_CHECK", json.dumps(record), flush=True)
+
+    def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        self.check(trainer, "epoch_start")
+
+    def on_train_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        self.check(trainer, "train_end")
+
+
+def validate_resume_settings(args: argparse.Namespace) -> None:
+    """Reject accidental restart or changed model/data/schedule within one run."""
+    path = args.output_dir / "run_config.json"
+    if args.resume is None:
+        if path.exists():
+            raise ValueError("This output directory already contains a run. Use --resume or a new output directory.")
+        return
+    if not path.is_file():
+        raise FileNotFoundError("Resuming requires the matching run_config.json in the original output directory.")
+    previous = json.loads(path.read_text(encoding="utf-8"))
+    keys = ["data","batch_size","accumulate_grad_batches","seed","cutoff","threebody_cutoff",
+            "diep_grid_half_length","diep_grid_spacing","transformer_nhead","transformer_num_layers",
+            "transformer_dim_ff","transformer_dropout","lr","decay_steps","decay_alpha","devices"]
+    changed = [key for key in keys if previous.get(key) != json_ready(getattr(args, key))]
+    if changed:
+        raise ValueError("Resume settings differ from the original run: " + ", ".join(changed))
+    checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+    completed = int(checkpoint["epoch"]) + 1
+    if args.max_epochs <= completed:
+        raise ValueError(f"--max-epochs is a cumulative endpoint and must exceed completed epochs ({completed}).")
+    if len(checkpoint.get("lr_schedulers", [])) != 1 or checkpoint["lr_schedulers"][0]["last_epoch"] != completed:
+        raise ValueError("Checkpoint does not have one scheduler step per completed epoch; do not silently reuse it.")
+    print(f"Resume precheck: {completed} completed epochs; cumulative endpoint {args.max_epochs}.", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     args.data = args.data.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.resume is not None and not args.resume.is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+    if args.max_epochs < 1 or args.batch_size < 1 or args.accumulate_grad_batches < 1 or args.decay_steps < 1:
+        raise ValueError("Epochs, batch size, accumulation and decay steps must be positive.")
+    validate_resume_settings(args)
 
     if not args.data.is_file():
         raise FileNotFoundError(f"MatPES JSON file not found: {args.data}")
@@ -351,6 +439,10 @@ def main() -> None:
 
     model = M3GNet(
         element_types=DEFAULT_ELEMENTS,
+        cutoff=args.cutoff,
+        threebody_cutoff=args.threebody_cutoff,
+        diep_grid_half_length=args.diep_grid_half_length,
+        diep_grid_spacing=args.diep_grid_spacing,
         is_intensive=False,
         readout_type="transformer",
         transformer_nhead=args.transformer_nhead,
@@ -371,7 +463,9 @@ def main() -> None:
         force_weight=1.0,
         stress_weight=0.1,
         loss="huber_loss",
-        lr=1e-3,
+        lr=args.lr,
+        decay_steps=args.decay_steps,
+        decay_alpha=args.decay_alpha,
     )
 
     best_checkpoint = ModelCheckpoint(
@@ -394,6 +488,7 @@ def main() -> None:
     )
     csv_logger = CSVLogger(save_dir=args.output_dir, name="logs")
     tensorboard_logger = TensorBoardLogger(save_dir=args.output_dir, name="tensorboard")
+    schedule_check = EpochScheduleCheck(args.lr, args.decay_steps, args.decay_alpha)
 
     trainer_kwargs: dict[str, Any] = {
         "max_epochs": args.max_epochs,
@@ -406,6 +501,7 @@ def main() -> None:
             best_checkpoint,
             epoch_checkpoint,
             LearningRateMonitor(logging_interval="epoch"),
+            schedule_check,
         ],
         "num_sanity_val_steps": 0,
         "log_every_n_steps": 1000,
@@ -431,21 +527,29 @@ def main() -> None:
     (args.output_dir / "run_config.json").write_text(
         json.dumps(json_ready(config), indent=2), encoding="utf-8"
     )
+    # Preserve each segment's settings as well as the convenient latest config.
+    config_archive = args.output_dir / "configs"
+    config_archive.mkdir(exist_ok=True)
+    (config_archive / f"run_config_{time.time_ns()}.json").write_text(
+        json.dumps(json_ready(config), indent=2), encoding="utf-8"
+    )
 
     training_start = time.perf_counter()
     # The MATH SDPA backend supports the higher-order derivatives required by force training.
-    with sdpa_kernel(SDPBackend.MATH):
+    with math_attention():
         trainer.fit(
             model=lit_module,
             train_dataloaders=train_loader,
             val_dataloaders=val_loader,
             ckpt_path=str(args.resume) if args.resume is not None else None,
         )
-        test_results = trainer.test(
-            model=lit_module,
-            dataloaders=test_loader,
-            ckpt_path=best_checkpoint.best_model_path,
-        )[0]
+        test_results = None
+        if not args.skip_test:
+            test_results = trainer.test(
+                model=lit_module,
+                dataloaders=test_loader,
+                ckpt_path=best_checkpoint.best_model_path,
+            )[0]
 
     elapsed_minutes = (time.perf_counter() - training_start) / 60
     result = {
@@ -453,12 +557,21 @@ def main() -> None:
         "best_val_total_loss": best_checkpoint.best_model_score,
         "training_and_test_minutes": elapsed_minutes,
         "test": test_results,
+        "test_skipped": args.skip_test,
+        "completed_epochs": trainer.current_epoch,
+        "global_step": trainer.global_step,
+        "scheduler_state": trainer.lr_scheduler_configs[0].scheduler.state_dict(),
+        "scheduler_checks": schedule_check.records,
     }
-    (args.output_dir / "test_results.json").write_text(
+    result_file = "segment_results.json" if args.skip_test else "test_results.json"
+    (args.output_dir / result_file).write_text(
+        json.dumps(json_ready(result), indent=2), encoding="utf-8"
+    )
+    (config_archive / f"segment_result_{time.time_ns()}.json").write_text(
         json.dumps(json_ready(result), indent=2), encoding="utf-8"
     )
 
-    print("Training and testing complete.")
+    print("Training complete; held-out test skipped." if args.skip_test else "Training and testing complete.")
     print("Best checkpoint:", best_checkpoint.best_model_path)
     print("Best validation loss:", best_checkpoint.best_model_score)
     print("Elapsed minutes:", elapsed_minutes)

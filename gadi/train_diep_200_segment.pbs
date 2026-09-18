@@ -1,0 +1,69 @@
+#!/bin/bash
+#PBS -P xq82
+#PBS -q gpuhopper
+#PBS -N diep_200_segment
+#PBS -l ncpus=12
+#PBS -l ngpus=1
+#PBS -l mem=256GB
+#PBS -l jobfs=20GB
+#PBS -l walltime=04:00:00
+#PBS -l storage=scratch/xq82
+#PBS -l wd
+#PBS -j oe
+
+# Submit from the NEW DIEP repository root. No automatic qsub/job chaining.
+# First measurement: qsub gadi/train_diep_200_segment.pbs
+# Later segment (example only, choose endpoint after measuring actual speed):
+# qsub -l walltime=48:00:00 -v END_EPOCH=40 gadi/train_diep_200_segment.pbs
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Submit this file with qsub from the DIEP repository root}"
+REPO_ROOT="$PWD"
+END_EPOCH="${END_EPOCH:-2}"
+if ! [[ "$END_EPOCH" =~ ^[0-9]+$ ]] || (( END_EPOCH < 1 || END_EPOCH > 200 )); then
+    echo 'END_EPOCH must be a cumulative epoch count between 1 and 200.' >&2
+    exit 2
+fi
+test -f "$REPO_ROOT/src/matgl/layers/_diep.py"
+test -f "$REPO_ROOT/train_transformer_atomic_sum_full_matpes.py"
+
+source /scratch/xq82/bd1444/diepformer_dgl_work/miniforge3/etc/profile.d/conda.sh
+conda activate /scratch/xq82/bd1444/matglformer_linear_work/envs/matgl-linear
+
+export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+DATA="${DATA:-/scratch/xq82/bd1444/matglformer_linear_work/data/MatPES-PBE-2025.2.json}"
+OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/runs/diep_bs32_acc4_200ep}"
+test -f "$DATA"
+mkdir -p "$OUTPUT_DIR"
+
+# Refuse simultaneous writers to one training run (lock is released on exit).
+exec 9>"$OUTPUT_DIR/training.lock"
+flock -n 9 || { echo 'Another job is using this output directory.' >&2; exit 3; }
+
+echo "Campaign target: 200 epochs; this segment ends at epoch $END_EPOCH"
+echo "Repository: $REPO_ROOT; data: $DATA; output: $OUTPUT_DIR"
+echo "Git commit: $(git rev-parse HEAD)"
+python --version
+nvidia-smi
+
+resume_args=()
+if [[ -f "$OUTPUT_DIR/checkpoints/last.ckpt" ]]; then
+    resume_args=(--resume "$OUTPUT_DIR/checkpoints/last.ckpt")
+elif [[ -f "$OUTPUT_DIR/run_config.json" ]]; then
+    echo 'Existing run has no last.ckpt; inspect it before restarting.' >&2
+    exit 4
+fi
+test_args=(--skip-test)
+if (( END_EPOCH == 200 )); then test_args=(); fi
+
+# Fresh, separate graph cache by default. Do not reuse a cache with unverified data/units.
+python -u train_transformer_atomic_sum_full_matpes.py \
+    --data "$DATA" --output-dir "$OUTPUT_DIR" \
+    --max-epochs "$END_EPOCH" --batch-size 32 --accumulate-grad-batches 4 \
+    --num-workers 8 --accelerator gpu --devices 1 --seed 42 \
+    --cutoff 5 --threebody-cutoff 4 --diep-grid-half-length 5 --diep-grid-spacing 1 \
+    --transformer-nhead 4 --transformer-num-layers 1 --transformer-dim-ff 128 --transformer-dropout 0 \
+    --lr 0.001 --decay-steps 1000 --decay-alpha 0.01 \
+    "${resume_args[@]}" "${test_args[@]}"

@@ -3,10 +3,10 @@
 Implements :class:`ThreeBodyInteractions`, the M3GNet/CHGNet angular
 update that consumes a line graph (whose edges represent triplets of
 neighbours sharing a central atom) and produces an updated edge feature
-on the original graph. The combined radial-x-angular basis comes from
-:class:`~matgl.layers._basis.SphericalBesselWithHarmonics`, multiplied by
-two cosine cutoffs (one per bond in the triplet) and folded back into
-the bond messages by :func:`combine_sbf_shf`.
+on the original graph. The caller supplies the triplet basis (DIEP grid
+features in this model) and the per-bond cutoff weights. The layer combines
+each basis with its neighbour's features, multiplies the two cutoff weights,
+and scatters the contribution to its explicitly identified original bond.
 
 Line-graph construction is handled by :mod:`matgl.graph._compute` upstream.
 """
@@ -18,7 +18,7 @@ import torch
 from torch import nn
 
 import matgl
-from matgl.utils.maths import _block_repeat, get_segment_indices_from_n, scatter_sum
+from matgl.utils.maths import _block_repeat, scatter_sum
 
 
 class ThreeBodyInteractions(nn.Module):
@@ -57,11 +57,13 @@ class ThreeBodyInteractions(nn.Module):
         Args:
             edge_dst_atom: For each bond ``b`` in the parent graph, the index
                 of the destination atom of that bond. Shape ``(num_bonds,)``.
-            line_edge_index: Line-graph edges as ``(2, num_triples)`` with
-                row 0 = source bond index, row 1 = destination bond index.
+            line_edge_index: Triplet bond pairs as ``(2, num_triples)``, with
+                both rows indexing bonds in the original parent graph.
+                Row 0 is the receiving bond; row 1 supplies the neighbour atom.
             n_triple_ij: For each bond, the number of triples it participates
-                in as the "central" bond. Shape ``(num_bonds,)``. Used to
-                build segment ids for the per-bond aggregation.
+                in as the "central" bond. Shape ``(num_bonds,)``. Retained for
+                API compatibility; aggregation uses the explicit receiving
+                bond indices, so triplet order does not affect the result.
             num_bonds: Total number of bonds in the parent graph (i.e. the
                 ``dim_size`` for the per-bond scatter).
             three_basis: three body basis expansion of shape
@@ -91,8 +93,13 @@ class ThreeBodyInteractions(nn.Module):
         # Compute the weighted basis
         basis = basis * weights[:, None]
 
-        # Aggregate the new bonds using scatter_sum
-        segment_ids = get_segment_indices_from_n(n_triple_ij)
+        # 原写法：根据三体数量生成聚合目标，依赖计数与三体排列顺序完全一致。
+        # segment_ids = get_segment_indices_from_n(n_triple_ij)
+
+        # 新写法：每个三体直接使用自己的接收边编号。
+        # 调用方已把线图的小表编号转换为原图边编号；这里按原图编号聚合。
+        # 即使打乱三体排列顺序，也会加回同一条原图边。
+        segment_ids = line_edge_index[0].long()
         new_bonds = scatter_sum(
             basis.to(matgl.float_th),
             segment_ids=segment_ids,

@@ -56,9 +56,13 @@ class MatglLightningModuleMixin:
         return results["Total_Loss"]
 
     def on_train_epoch_end(self) -> None:
-        """Step scheduler every epoch."""
-        sch = self.lr_schedulers()  # type: ignore[attr-defined]
-        sch.step()
+        """Leave epoch scheduler stepping to Lightning's automatic optimization."""
+        # configure_optimizers() registers the scheduler with Lightning, which
+        # already advances it once per epoch. The previous manual call below
+        # advanced the same scheduler a second time and shortened its schedule.
+        # sch = self.lr_schedulers()
+        # sch.step()
+        pass
 
     def optimizer_zero_grad(
         self,

@@ -138,7 +138,16 @@ def _compute_3body_indices(
     n_bond_per_atom = np.bincount(src_np, minlength=num_nodes)
 
     n_triple = int((n_bond_per_atom * (n_bond_per_atom - 1)).sum())
-    n_triple_ij_np = np.repeat(n_bond_per_atom - 1, n_bond_per_atom)
+    # 原写法：假定同一中心原子的边已经连续排列。
+    # n_triple_ij_np = np.repeat(n_bond_per_atom - 1, n_bond_per_atom)
+
+    # 每条边有几个三体，取决于它的中心原子还有几条其他边。
+    # 按输入边的实际顺序查数，保持“第几行就是哪条边”的对应关系。
+    n_triple_ij_np = n_bond_per_atom[src_np] - 1
+
+    # 只建立按中心原子分组的查找表，不修改输入图的边顺序。
+    # edge_order 中保存的仍是输入边表里的编号。
+    edge_order = np.argsort(src_np, kind="stable")
 
     triple_bond_indices = np.empty((n_triple, 2), dtype=matgl.int_np)
     start = 0
@@ -150,7 +159,12 @@ def _compute_3body_indices(
             final = np.stack([y.ravel(), x.ravel()], axis=1)
             mask = final[:, 0] != final[:, 1]
             final = final[mask]
-            triple_bond_indices[start : start + n * (n - 1)] = final + cs
+            # 原写法：用连续编号代替这个中心实际拥有的边编号。
+            # triple_bond_indices[start : start + n * (n - 1)] = final + cs
+
+            # 先找到这个中心实际拥有的边，再把两两配对的位置换成边编号。
+            center_edge_ids = edge_order[cs : cs + n]
+            triple_bond_indices[start : start + n * (n - 1)] = center_edge_ids[final]
             start += n * (n - 1)
             cs += n
 

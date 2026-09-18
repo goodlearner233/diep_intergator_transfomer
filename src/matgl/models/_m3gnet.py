@@ -70,6 +70,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from torch import nn
+from pymatgen.core import Element  # 根据元素符号查询原子序数 Z
 
 from matgl.config import DEFAULT_ELEMENTS
 from matgl.graph._compute import (
@@ -81,13 +82,15 @@ from matgl.graph._compute import (
 from matgl.layers import (
     MLP,  # 普通多层感知机，用在输出层、三体 atom update 等位置
     ActivationFunction,  # 根据字符串选择激活函数，比如 swish、softplus2
-    BondExpansion,  # 把边距离 r_ij 展开成径向 basis / edge_attr
+    DIEPGrid,  # 根据范围和间距，创建 DIEP 的二维采样网格
     EmbeddingBlock,#把原子类型和距离信息编码成特征向量，作为后续 message passing 的输入
     GatedMLP, #gMLP。论文里定义了
     M3GNetBlock,  # M3GNet 的主图卷积层，负责 edge/node/state 消息传递
     Set2SetReadOut,#对MEGNET是核心但对M3GNET只是一个可选参数
     SphericalBesselWithHarmonics,#对应公式2，把三体几何距离+角度变成三体特征向量
     ThreeBodyInteractions,#三体信息聚合回边e_ij
+    compute_bond_features,  # 键长 + 两端原子序数 + 网格 -> 二体 DIEP basis
+    compute_triplet_features,  # 三体坐标 + 原子序数 Z + 网格 -> 三体 DIEP basis
 )
 from matgl.layers._readout_torch import ReduceReadOut, TransformerAtomicReadOut, WeightedAtomReadOut, WeightedReadOut  # Reduce/Weighted readout，用于普通性质或势能分支
 from matgl.utils.cutoff import polynomial_cutoff  # 三体 cutoff，让远距离三体作用平滑衰减到 0
@@ -115,7 +118,7 @@ class M3GNet(MatGLModel):
         max_n: int = 3,  # 径向 basis 阶数，控制距离展开大小 对应公式2中z_ln，径向 radial basis 数量，对应球贝塞尔函数里和距离 r 有关的展开通道
         max_l: int = 3,  # 角向 basis 阶数，控制三体角度展开大小，对应公式2中Y_l，角向 angular basis 数量，对应球谐函数里和角度 θ 有关的展开通道
         nblocks: int = 3,  # M3GNet 层数，每层先 three-body 再 graph conv
-        rbf_type: Literal["Gaussian", "SphericalBessel"] = "SphericalBessel",  # 二体距离展开方式，默认球贝塞尔
+        rbf_type: Literal["Gaussian", "SphericalBessel"] = "SphericalBessel",  # 保留原有参数接口；当前二体 basis 已改用 DIEP
         is_intensive: bool = True,  # True 做普通性质预测；False 做总能量/势函数 sum
         readout_type: Literal["set2set", "weighted_atom", "reduce_atom", "transformer"] = "weighted_atom",  # 普通性质预测时的聚合方式,我加入了 transformer 方式
         transformer_nhead: int = 8,  # Transformer readout 的多头 attention 头数
@@ -135,6 +138,11 @@ class M3GNet(MatGLModel):
         include_state: bool = False,  # 是否把全局 state/u 加入消息传递
         activation_type: Literal["swish", "tanh", "sigmoid", "softplus2", "softexp"] = "swish",  # 激活函数类型
         dropout: float | None = None,  # dropout 比例，默认不用
+
+        # DIEP 网格设置：x、y 两个方向都覆盖 [-L, L]。
+        diep_grid_half_length: float = 5.0,  # L：网格范围的一半
+        diep_grid_spacing: float = 1.0,  # 相邻采样点的目标间距
+
         **kwargs,
     ):
         """Initialize the M3GNet model."""
@@ -150,11 +158,38 @@ class M3GNet(MatGLModel):
             ) from None
 
         self.element_types = element_types or DEFAULT_ELEMENTS  # 保存元素表，后面 graph converter 和 embedding 都要对齐
+        # DIEP：建立“元素类别编号 → 真实原子序数 Z”的固定查找表。
+        # 顺序与 self.element_types 相同。
+        # 例如元素表为 ("Li", "O", "H")，这里保存 [3, 8, 1]。
+        self.register_buffer(
+            "atomic_number_table",
+            torch.tensor(
+                [Element(symbol).Z for symbol in self.element_types],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
 
-        self.bond_expansion = BondExpansion(max_l, max_n, cutoff, rbf_type=rbf_type, smooth=use_smooth)  # 创建二体距离展开模块，bond_dist -> expanded_dists；默认用球贝塞尔函数，和 MEGNet 默认 Gaussian 不同
+        # DIEP：保存网格设置，后面计算 basis 时据此创建网格。
+        self.diep_grid_half_length = diep_grid_half_length
+        self.diep_grid_spacing = diep_grid_spacing
 
-        degree = max_n * max_l * max_l if use_phi else max_n * max_l  # 三体 basis 的维度，use_phi=True 时，三体角度描述更完整，所以 basis 维度更大。
-        degree_rbf = max_n if use_smooth else max_n * max_l  # 二体径向 basis 的维度
+        # DIEP 二体 basis 的维度：grid 模式下，每个采样点贡献一个分量。
+        # 点数算法与 DIEPGrid 一致；默认每轴 11 点，共 121 个分量。
+        if self.diep_grid_half_length <= 0 or self.diep_grid_spacing <= 0:
+            raise ValueError("DIEP grid half length and spacing must be positive.")
+        num_diep_axis_points = int(round(2 * self.diep_grid_half_length / self.diep_grid_spacing)) + 1
+        if num_diep_axis_points < 2:
+            raise ValueError("At least two DIEP grid points per axis are required.")
+        degree_rbf = num_diep_axis_points * num_diep_axis_points
+        # 下方 EmbeddingBlock 和 M3GNetBlock 都使用 degree_rbf 接收二体 basis。
+
+        # 原 M3GNet 写法：根据贝塞尔和球谐展开参数计算三体 basis 的维度。
+        # 保留作对照，当前不执行。
+        # degree = max_n * max_l * max_l if use_phi else max_n * max_l
+
+        # DIEP 写法：三体也采用同一张网格的 grid 输出，因此 basis 长度等于网格点数。
+        degree = degree_rbf
 
         self.embedding = EmbeddingBlock(  # 创建初始 embedding 模块，生成 node/edge/state 初始特征
             degree_rbf=degree_rbf,
@@ -307,7 +342,41 @@ class M3GNet(MatGLModel):
         #读入图信息
         node_types = getattr(g, "node_type", getattr(g, "z", None))  # 读取原子类型，node_type 或 z
         pos = g.pos  # 从图g拿原子笛卡尔坐标
+        # DIEP：根据类别编号查表，得到每颗原子的真实原子序数。
+        # node_types 仍然保留，继续供原来的节点 Embedding 使用。
+
+        # 查找表与类别编号放在相同设备上，方便索引。
+        atomic_table = self.atomic_number_table.to(
+            device=node_types.device
+        )
+
+        # 按类别编号取出 Z，再转换成与坐标相同的浮点类型。
+        atomic_numbers = atomic_table[node_types.long()].to(
+            dtype=pos.dtype
+        )
+
         edge_index = g.edge_index  # 原子图的边连接关系，shape 是 (2, num_edges)
+
+        # DIEP 二体输入：根据每条边的两个端点，取得对应原子序数。
+        # 注意区分：
+        # atom_ids 保存“原子在当前图中的编号”；
+        # z 保存这些原子的真实原子序数。
+
+        # 1. 每条边的起点、终点原子编号，形状都是 [边数]。
+        bond_src_atom_ids = edge_index[0]
+        bond_dst_atom_ids = edge_index[1]
+
+        # 2. 根据原子编号，从 atomic_numbers 中取出真实 Z。
+        bond_src_z = atomic_numbers[bond_src_atom_ids]
+        bond_dst_z = atomic_numbers[bond_dst_atom_ids]
+
+        # 3. 将同一条边的两个 Z 配在一起。
+        # 结果形状：[边数, 2]，每一行都是一条边的 [Z_i, Z_j]。
+        bond_atomic_numbers = torch.stack(
+            (bond_src_z, bond_dst_z),
+            dim=1,
+        )
+
         pbc_offshift = getattr(g, "pbc_offshift", None)  # 周期性边界下的真实空间偏移
         batch = getattr(g, "batch", None)  # batch 中每个节点属于哪个结构
         num_graphs = getattr(g, "num_graphs", None)
@@ -320,17 +389,126 @@ class M3GNet(MatGLModel):
 # #pos + edge_index
 # -> 每条边的向量 bond_vec
 # -> 每条边的距离 bond_dist
-# -> 距离展开 expanded_dists(下面两句)
+# -> 结合两端原子序数和网格，计算二体 DIEP basis expanded_dists
         bond_vec, bond_dist = compute_pair_vector_and_distance(pos, edge_index, pbc_offshift)  # 根据坐标和 edge_index 计算每条边的向量和距离
-        expanded_dists = self.bond_expansion(bond_dist)  # 把 r_ij 展开成二体径向 basis e0ij
+
+        # DIEP：用模型保存的设置创建二维网格，本次计算的所有二体、三体片段共用。
+        # 网格与键长使用相同的设备和浮点类型，方便后续一起计算。
+        diep_grid = DIEPGrid(
+            half_length=self.diep_grid_half_length,  # x、y 都从 -L 到 L
+            spacing=self.diep_grid_spacing,  # 相邻采样点的目标间距
+            device=bond_dist.device,  # 跟随键长放在 CPU 或 GPU 上
+            dtype=bond_dist.dtype,  # 跟随键长使用 float32 或 float64 等类型
+        )
+
+        # DIEP 二体：批量计算每条边在各网格点上的 rho * V * delta_area。
+        # 保留 expanded_dists 变量名，继续送入初始边 Embedding 和各 M3GNet block。
+        # grid 模式输出 [边数, 网格点数]；默认是 [边数, 121]。
+        expanded_dists = compute_bond_features(
+            bond_dist=bond_dist,  # [边数]：原代码算出的键长
+            atomic_numbers=bond_atomic_numbers,  # [边数, 2]：每条边两端的真实 Z
+            grid=diep_grid,  # 这一批边共用的二维采样网格
+            mode="grid",  # 保留每个采样点的贡献，形成 basis 向量
+        )
+
+        # DIEP 二体 cutoff 平滑：原始网格向量不会在建图 cutoff 处自动归零。
+        # 每条边先根据自己的键长计算一个平滑因子，使用二体 self.cutoff。
+        # pair_cutoff: [边数]；unsqueeze(-1) 后为 [边数, 1]。
+        pair_cutoff = polynomial_cutoff(bond_dist, self.cutoff)
+
+        # 这一条边的全部网格分量，乘同一个因子；basis 形状保持不变。
+        # 后面的初始边 Embedding 和所有 M3GNet block 都使用这份平滑后的 basis。
+        expanded_dists = expanded_dists * pair_cutoff.unsqueeze(-1)
 
         if l_g is None:
             l_g = create_line_graph(edge_index, bond_dist, bond_vec, pbc_offshift, num_nodes, self.threebody_cutoff)  # 构造 line graph，找 bond-bond pair 形成三体角度
         else:
             l_g = ensure_line_graph_compatibility(l_g, bond_dist, bond_vec, pbc_offshift, self.threebody_cutoff)  # 复用已有 line graph，只刷新距离和向量
 
-        angles = compute_theta_and_phi(l_g["bond_vec"], l_g["bond_dist"], l_g["line_edge_index"])  # 根据 line_edge_index 计算两条 bond 的夹角 cos(theta)
-        three_body_basis = self.basis_expansion(angles["triple_bond_lengths"], angles["cos_theta"], angles["phi"])  # 把三体距离和角度展开成 three_body_basis，即球贝塞尔函数 × 球谐函数得到的三体几何 basis
+        # 三体输入准备：将筛选后的局部边编号，转换成原图边编号。
+
+        # 1. 读取三体对应的两条边，使用筛选后的局部编号。
+        # 形状：[2, 三体数]，每一列是一组三体的两条边。
+        triplet_local_edge_ids = l_g["line_edge_index"]
+
+        # 2. 读取编号对应表。
+        # kept_edge_ids[局部边编号] = 原图边编号。
+        kept_edge_ids = l_g["kept_edge_ids"]
+
+        # 3. 查表，得到每个三体对应的两条原图边。
+        # 形状仍然是：[2, 三体数]。
+        triplet_edge_ids = kept_edge_ids[triplet_local_edge_ids]
+
+        # M3GNet 已经找好了三体关系；这里查询每个三体涉及哪三颗原子。
+        # 以下变量保存的都是边或原子的“编号”，还不是原子序数 Z。
+
+        # 1. 取出每个三体的两条原图边编号，形状都是 [三体数]。
+        triplet_first_edge_ids = triplet_edge_ids[0]
+        triplet_second_edge_ids = triplet_edge_ids[1]
+
+        # 2. 第一条边的起点，就是三体的中心原子。
+        triplet_center_atom_ids = edge_index[0, triplet_first_edge_ids]
+
+        # 3. 第一条边的终点，就是第一个邻居原子 j。
+        triplet_neighbor_j_atom_ids = edge_index[1, triplet_first_edge_ids]
+
+        # 4. 第二条边的终点，就是第二个邻居原子 k。
+        triplet_neighbor_k_atom_ids = edge_index[1, triplet_second_edge_ids]
+
+        # 三体输入准备：根据三颗原子的原图编号，查询它们的原子序数 Z。
+
+        # 1. 把每个三体涉及的三个原子编号排成一行。
+        # 顺序与 DGL 实现一致：[邻居 j，中心原子，邻居 k]。
+        # 形状：[三体数, 3]。
+        triplet_atom_ids = torch.stack(
+            (
+                triplet_neighbor_j_atom_ids,
+                triplet_center_atom_ids,
+                triplet_neighbor_k_atom_ids,
+            ),
+            dim=1,
+        )
+
+        # 2. atomic_numbers 已经保存了图中每颗原子的真实 Z。
+        # 用上面的原子编号查表，得到每个三体的三个 Z。
+        # 形状：[三体数, 3]，顺序仍为 [邻居 j，中心原子，邻居 k]。
+        triplet_atomic_numbers = atomic_numbers[triplet_atom_ids]
+
+        # 为每个三体准备原始三维坐标，之后交给 DIEP 函数转换成二维坐标。
+
+        # 1. 用中心原子的原图编号，查询它的三维坐标。
+        triplet_center_pos = pos[triplet_center_atom_ids]
+
+        # 2. 中心坐标 + 指向邻居 j 的边向量，得到邻居 j 的坐标。
+        triplet_neighbor_j_pos = (
+            triplet_center_pos + bond_vec[triplet_first_edge_ids]
+        )
+
+        # 3. 中心坐标 + 指向邻居 k 的边向量，得到邻居 k 的坐标。
+        triplet_neighbor_k_pos = (
+            triplet_center_pos + bond_vec[triplet_second_edge_ids]
+        )
+
+        # 4. 将每个三体的三颗原子的坐标配成一组。
+        # 顺序与 Z 一致：[邻居 j，中心，邻居 k]。
+        # 形状：[三体数, 3颗原子, xyz三个坐标分量]。
+        triplet_coords = torch.stack(
+            (
+                triplet_neighbor_j_pos,
+                triplet_center_pos,
+                triplet_neighbor_k_pos,
+            ),
+            dim=1,
+        )
+
+        # 调用已经写好的 DIEP 三体函数，批量计算每个三体的 basis。
+        # 函数内部完成：二维转换 -> 网格距离 -> 密度和势因子 -> 网格贡献。
+        three_body_basis = compute_triplet_features(
+            coords=triplet_coords,  # 每个三体的三颗原子的三维坐标
+            atomic_numbers=triplet_atomic_numbers,  # 对应三颗原子的 Z
+            grid=diep_grid,  # 二维网格的采样点和面积权重
+            mode="grid",  # 保留各网格点的贡献，输出 [三体数, 网格点数]
+        )
         three_body_cutoff = polynomial_cutoff(bond_dist, self.threebody_cutoff)  # 三体 cutoff 权重，远距离平滑衰减到 0
 
         node_feat, edge_feat, state_feat = self.embedding(node_types, expanded_dists, state_attr)  # 生成初始 node/edge/state hidden features；这里把 expanded_dists/e0ij 编码或投影成 edge_feat，不是再做距离展开
@@ -344,8 +522,17 @@ class M3GNet(MatGLModel):
         }
 
         edge_dst_atom = edge_index[1]  # 每条边的终点原子 index，三体更新里要用
-        line_edge_index = l_g["line_edge_index"]  # 线图边，表示哪些 bond-bond pair 组成三体
-        n_triple_ij = l_g["n_triple_ij"]  # 每条 bond 参与的三体数量，用于聚合回 edge_feat
+        # 旧写法：线图使用筛选后的小表编号，不能直接拿来索引原图的边特征。
+        # line_edge_index = l_g["line_edge_index"]
+        # n_triple_ij = l_g["n_triple_ij"]
+
+        # 新写法：与前面计算三体坐标、Z 时使用同一套原图边编号。
+        # 第一行指定三体贡献加回哪条边，第二行指定提供邻居 k 的另一条边。
+        line_edge_index = triplet_edge_ids
+
+        # 按原图边编号统计三体数；未参与三体的原图边对应 0。
+        # 保留原更新层的参数接口，形状为 [原图边数]。
+        n_triple_ij = torch.bincount(line_edge_index[0].long(), minlength=num_bonds)
 
         for i in range(self.n_blocks):  # 逐层执行 M3GNet：每层先三体更新边，再 graph conv
             edge_feat = self.three_body_interactions[i](  # 用三体 basis 更新 edge_feat，把角度信息写进边特征

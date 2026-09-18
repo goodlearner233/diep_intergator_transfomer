@@ -1,0 +1,4 @@
+# Keep Linux job scripts usable after a Windows checkout or upload.
+*.sh text eol=lf
+*.pbs text eol=lf
+*.py text eol=lf
