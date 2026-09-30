@@ -1,6 +1,15 @@
 # DIEPformer training
 
-Fresh training of the repository's DIEPformer, with seed 42 and 200 epochs.
+After comparing our previous training setup with the [official DIEP training entry](https://github.com/materialsalchemist/diep/blob/3bf9cd4cf4fe43081fa37b89edff28eeb2ef9cca/scripts/train_mp_pes_pyg.py), we decided to retrain DIEPformer from scratch, adopting the following practices and adding diagnostics to investigate training spikes:
+
+- Fixed-size batches → atom-budget batches with a per-structure size limit.
+- No element reference offsets and unit output scale → MatPES atomic references and training-set force RMS scaling.
+- Adam → AdamW with AMSGrad and weight decay.
+- A cosine schedule designed for 1000 epochs → a schedule matching the proposed 200-epoch run, plus batch/update diagnostics to investigate spikes.
+
+The 121-channel DIEP → M3GNet → Transformer → linear-sum model is retained. The new Python entry is in this folder; the original training files are preserved.
+
+**Settings below are proposed defaults. Final training parameters, computing resources and the launch script will be agreed with Sherif after discussion.** Seed 42 is retained. No new cluster launcher is supplied yet.
 
 ## 1. What is recorded
 
@@ -24,7 +33,7 @@ To investigate a spike: **find the epoch → inspect its batches → inspect the
 
 ## 3. Start training
 
-From the repository root, activate its working Python environment and run this **after allocating four GPUs**. Replace the two input paths. Supply raw MatPES stress in kbar; the script converts it.
+Proposed four-GPU launch command, to confirm with Sherif. From the repository root, activate its working Python environment and run this **after allocating four GPUs**. Replace the two input paths. Supply raw MatPES stress in kbar; the script converts it.
 
 ~~~bash
 python training_official_aligned/train.py \

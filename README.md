@@ -5,13 +5,19 @@ implementation, followed by a Transformer encoder and a linear atomic-energy
 head. Atomic energies are summed per structure; MatGL's Potential wrapper
 computes forces and stress from energy derivatives.
 
+**New training proposal:** [training_official_aligned](training_official_aligned/README.md)
+compares the previous setup with official DIEP training practices and provides a
+separate fresh-training entry with additional diagnostics. Final parameters and
+the cluster launch script will be agreed with Sherif. The original entry remains
+at [train_transformer_atomic_sum_full_matpes.py](train_transformer_atomic_sum_full_matpes.py).
+
 - Pair DIEP descriptors use a polynomial cutoff envelope; triplet interactions
   retain the two-edge cutoff envelope and map filtered edge IDs to original edges.
 - Lightning advances the learning-rate scheduler once per epoch, with runtime
   checks and checkpoint-resume validation.
-- The prepared Gadi campaign targets **200 epochs**, starting with a **2-epoch
+- The original Gadi setup targets **200 epochs**, starting with a **2-epoch
   pilot** using batch size 32 and gradient accumulation 4.
-- See [Gadi setup and submission](gadi/README_GADI.md) for the current entry point,
+- See [Gadi setup and submission](gadi/README_GADI.md) for that original entry point,
   environment requirements, and resume commands.
 - A local architecture probe is available at
   [show_full_diep_architecture.py](测试笔记本/tools/show_full_diep_architecture.py).
